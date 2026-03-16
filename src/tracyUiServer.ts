@@ -20,11 +20,22 @@ const CONTENT_TYPES = new Map<string, string>([
 
 const REQUIRED_UI_FILES = ['index.html', 'favicon.svg', 'tracy-profiler.data', 'tracy-profiler.js', 'tracy-profiler.wasm'];
 const TRACE_SESSION_TTL_MS = 60 * 60 * 1000;
+const MAX_UI_LOG_BODY_BYTES = 64 * 1024;
 
 type TraceSession = {
   createdAt: number;
   fileName: string;
   traceUri: vscode.Uri;
+};
+
+type UiLogLevel = 'debug' | 'info' | 'log' | 'warn' | 'error';
+
+type UiLogPayload = {
+  level: UiLogLevel;
+  message: string;
+  pageId?: string;
+  source?: string;
+  traceId?: string;
 };
 
 export class TracyUiServer implements vscode.Disposable {
@@ -134,12 +145,23 @@ export class TracyUiServer implements vscode.Disposable {
   private async handleRequest(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
     try {
       const method = request.method ?? 'GET';
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+
+      if (url.pathname === '/api/logs') {
+        if (method !== 'POST') {
+          this.writeResponse(response, 405, 'text/plain; charset=utf-8', 'Method Not Allowed', method);
+          return;
+        }
+
+        await this.handleUiLogRequest(request, response);
+        return;
+      }
+
       if (method !== 'GET' && method !== 'HEAD') {
         this.writeResponse(response, 405, 'text/plain; charset=utf-8', 'Method Not Allowed', method);
         return;
       }
 
-      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
       if (url.pathname.startsWith('/api/traces/')) {
         await this.handleTraceRequest(url.pathname.slice('/api/traces/'.length), method, response);
         return;
@@ -191,6 +213,36 @@ export class TracyUiServer implements vscode.Disposable {
     this.writeBufferResponse(response, 200, 'application/octet-stream', Buffer.from(bytes), method, headers);
   }
 
+  private async handleUiLogRequest(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
+    let payload: UiLogPayload | undefined;
+
+    try {
+      const requestBody = await readRequestBody(request, MAX_UI_LOG_BODY_BYTES);
+      const parsedBody: unknown = JSON.parse(requestBody.toString('utf8'));
+      payload = parseUiLogPayload(parsedBody);
+    } catch (error) {
+      const isTooLarge = error instanceof RequestBodyTooLargeError;
+      const statusCode = isTooLarge ? 413 : 400;
+      const message = isTooLarge ? 'Request Entity Too Large' : 'Invalid log payload';
+      this.writeResponse(response, statusCode, 'text/plain; charset=utf-8', message, request.method ?? 'POST');
+      return;
+    }
+
+    if (!payload) {
+      this.writeResponse(response, 400, 'text/plain; charset=utf-8', 'Invalid log payload', request.method ?? 'POST');
+      return;
+    }
+
+    this.cleanupTraceSessions();
+    const session = payload.traceId ? this.traceSessions.get(payload.traceId) : undefined;
+    this.log(formatUiLogMessage(payload, session?.fileName));
+
+    response.writeHead(204, {
+      'Cache-Control': 'no-store',
+    });
+    response.end();
+  }
+
   private resolveAssetPath(requestPath: string): string | undefined {
     const pathname = requestPath === '/' ? '/index.html' : requestPath;
     const resolvedPath = path.resolve(this.rootPath, `.${pathname}`);
@@ -240,13 +292,134 @@ function injectBridgeScript(html: string): string {
     (function () {
       const searchParams = new URLSearchParams(window.location.search);
       const traceId = searchParams.get('trace');
-      if (!traceId) {
-        return;
-      }
-
-      const traceUrl = '/api/traces/' + encodeURIComponent(traceId);
+      const traceUrl = traceId ? '/api/traces/' + encodeURIComponent(traceId) : undefined;
+      const logEndpoint = '/api/logs';
+      const pageId = typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : String(Date.now()) + '-' + Math.random().toString(16).slice(2);
+      const originalConsole = {
+        debug: typeof console.debug === 'function' ? console.debug.bind(console) : console.log.bind(console),
+        error: typeof console.error === 'function' ? console.error.bind(console) : console.log.bind(console),
+        info: typeof console.info === 'function' ? console.info.bind(console) : console.log.bind(console),
+        log: typeof console.log === 'function' ? console.log.bind(console) : function () {},
+        warn: typeof console.warn === 'function' ? console.warn.bind(console) : console.log.bind(console),
+      };
       let hasStarted = false;
       let isRuntimeReady = false;
+
+      function createJsonReplacer() {
+        const seen = new WeakSet();
+        return function (_key, value) {
+          if (value instanceof Error) {
+            return {
+              message: value.message,
+              name: value.name,
+              stack: value.stack,
+            };
+          }
+
+          if (typeof value === 'bigint') {
+            return value.toString() + 'n';
+          }
+
+          if (typeof value === 'object' && value !== null) {
+            if (seen.has(value)) {
+              return '[Circular]';
+            }
+
+            seen.add(value);
+          }
+
+          return value;
+        };
+      }
+
+      function formatLogArg(value) {
+        if (typeof value === 'string') {
+          return value;
+        }
+
+        if (value instanceof Error) {
+          return value.stack || value.message;
+        }
+
+        if (typeof value === 'undefined') {
+          return 'undefined';
+        }
+
+        try {
+          return JSON.stringify(value, createJsonReplacer());
+        } catch (_error) {
+          return String(value);
+        }
+      }
+
+      function postUiLog(level, source, argsLike) {
+        const args = Array.prototype.slice.call(argsLike);
+        const message = args.map(formatLogArg).join(' ');
+        if (!message) {
+          return;
+        }
+
+        const body = JSON.stringify({
+          level,
+          message: message.length > 32000 ? message.slice(0, 32000) + ' ...<truncated>' : message,
+          pageId,
+          source,
+          traceId,
+        });
+
+        void fetch(logEndpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body,
+          cache: 'no-store',
+          keepalive: true,
+        }).catch(function () {
+          // Best-effort logging only.
+        });
+      }
+
+      for (const level of ['debug', 'error', 'info', 'log', 'warn']) {
+        const originalMethod = originalConsole[level] || originalConsole.log;
+        console[level] = function () {
+          originalMethod.apply(console, arguments);
+          postUiLog(level, 'console', arguments);
+        };
+      }
+
+      if (typeof Module === 'object' && Module) {
+        const originalPrintErr = typeof Module.printErr === 'function' ? Module.printErr.bind(Module) : undefined;
+        Module.printErr = function () {
+          if (originalPrintErr) {
+            originalPrintErr.apply(Module, arguments);
+            return;
+          }
+
+          console.error.apply(console, arguments);
+        };
+      }
+
+      window.addEventListener('error', (event) => {
+        const details = [];
+        if (event.message) {
+          details.push(event.message);
+        }
+        if (event.filename) {
+          details.push(event.filename + ':' + event.lineno + ':' + event.colno);
+        }
+        if (event.error) {
+          details.push(event.error);
+        }
+
+        postUiLog('error', 'window.error', details);
+      });
+
+      window.addEventListener('unhandledrejection', (event) => {
+        postUiLog('error', 'unhandledrejection', [event.reason]);
+      });
 
       Module.postRun = Array.isArray(Module.postRun) ? Module.postRun : [];
       Module.postRun.push(() => {
@@ -255,7 +428,7 @@ function injectBridgeScript(html: string): string {
       });
 
       async function openTraceIfReady() {
-        if (!isRuntimeReady || hasStarted) {
+        if (!traceUrl || !isRuntimeReady || hasStarted) {
           return;
         }
 
@@ -317,6 +490,11 @@ function injectBridgeScript(html: string): string {
     })();
   </script>`;
 
+  const bootstrapScriptTag = '<script async type="text/javascript" src="tracy-profiler.js"></script>';
+  if (html.includes(bootstrapScriptTag)) {
+    return html.replace(bootstrapScriptTag, `  ${bridgeScript}\n    ${bootstrapScriptTag}`);
+  }
+
   return html.replace('</body>', `  ${bridgeScript}\n</body>`);
 }
 
@@ -326,4 +504,77 @@ function escapeHeaderValue(value: string): string {
 
 function isNodeError(value: unknown): value is NodeJS.ErrnoException {
   return !!value && typeof value === 'object' && 'code' in value;
+}
+
+function isUiLogLevel(value: string): value is UiLogLevel {
+  return value === 'debug' || value === 'error' || value === 'info' || value === 'log' || value === 'warn';
+}
+
+function parseUiLogPayload(value: unknown): UiLogPayload | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+
+  const candidate = value as {
+    level?: unknown;
+    message?: unknown;
+    pageId?: unknown;
+    source?: unknown;
+    traceId?: unknown;
+  };
+
+  if (typeof candidate.level !== 'string' || !isUiLogLevel(candidate.level) || typeof candidate.message !== 'string') {
+    return undefined;
+  }
+
+  return {
+    level: candidate.level,
+    message: candidate.message,
+    pageId: typeof candidate.pageId === 'string' ? candidate.pageId : undefined,
+    source: typeof candidate.source === 'string' ? candidate.source : undefined,
+    traceId: typeof candidate.traceId === 'string' ? candidate.traceId : undefined,
+  };
+}
+
+function formatUiLogMessage(payload: UiLogPayload, fileName: string | undefined): string {
+  const parts = ['Tracy UI', `[${payload.level}]`];
+
+  if (fileName) {
+    parts.push(`[${fileName}]`);
+  } else if (payload.traceId) {
+    parts.push(`[trace ${payload.traceId.slice(0, 8)}]`);
+  } else if (payload.pageId) {
+    parts.push(`[page ${payload.pageId.slice(0, 8)}]`);
+  }
+
+  if (payload.source && payload.source !== 'console') {
+    parts.push(`[${payload.source}]`);
+  }
+
+  parts.push(payload.message);
+  return parts.join(' ');
+}
+
+async function readRequestBody(request: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+
+    if (totalBytes > maxBytes) {
+      throw new RequestBodyTooLargeError();
+    }
+
+    chunks.push(buffer);
+  }
+
+  return Buffer.concat(chunks, totalBytes);
+}
+
+class RequestBodyTooLargeError extends Error {
+  public constructor() {
+    super('Request body too large.');
+  }
 }

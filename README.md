@@ -10,11 +10,16 @@ Use the upstream Tracy wasm UI inside VS Code.
 
 ## Development
 
-Install dependencies and fetch the Tracy UI bundle:
+Fetch `tracy-ui`
+
+```sh
+pnpm tracy:fetch
+```
+
+Compile
 
 ```sh
 pnpm install
-pnpm tracy:fetch
 pnpm compile
 pnpm run package:vsix
 ```

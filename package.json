@@ -2,7 +2,7 @@
   "name": "vscode-tracy",
   "displayName": "vscode-tracy",
   "description": "vscode tracy ui",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "gglin001-vscode",
   "license": "MIT",
   "packageManager": "pnpm@10.30.0",

@@ -23,7 +23,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand(COMMAND_OPEN_TRACE, async (resource?: vscode.Uri) => {
-      await openTrace(resource ?? vscode.window.activeTextEditor?.document.uri, log);
+      await openTrace(resolveCommandResource(resource), log);
     }),
   );
 
@@ -32,6 +32,40 @@ export function activate(context: vscode.ExtensionContext): void {
       output.show(true);
     }),
   );
+}
+
+function resolveCommandResource(resource?: vscode.Uri): vscode.Uri | undefined {
+  if (resource) {
+    return resource;
+  }
+
+  const activeEditorUri = vscode.window.activeTextEditor?.document.uri;
+  if (activeEditorUri) {
+    return activeEditorUri;
+  }
+
+  const activeTabInput = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+  if (activeTabInput instanceof vscode.TabInputText) {
+    return activeTabInput.uri;
+  }
+
+  if (activeTabInput instanceof vscode.TabInputTextDiff) {
+    return activeTabInput.modified;
+  }
+
+  if (activeTabInput instanceof vscode.TabInputCustom) {
+    return activeTabInput.uri;
+  }
+
+  if (activeTabInput instanceof vscode.TabInputNotebook) {
+    return activeTabInput.uri;
+  }
+
+  if (activeTabInput instanceof vscode.TabInputNotebookDiff) {
+    return activeTabInput.modified;
+  }
+
+  return undefined;
 }
 
 async function openTrace(traceUri: vscode.Uri | undefined, log: (message: string) => void): Promise<void> {

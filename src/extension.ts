@@ -94,21 +94,8 @@ async function openTrace(traceUri: vscode.Uri | undefined, log: (message: string
 }
 
 async function openInVsCodeBrowser(url: string, log: (message: string) => void): Promise<void> {
-  const commandList = await vscode.commands.getCommands(true);
-
-  if (commandList.includes('workbench.action.browser.open')) {
-    log('Opening Tracy in the integrated browser.');
-    await vscode.commands.executeCommand('workbench.action.browser.open', url);
-    return;
-  }
-
-  if (commandList.includes('simpleBrowser.show')) {
-    log('Integrated browser command is unavailable, falling back to Simple Browser.');
-    await vscode.commands.executeCommand('simpleBrowser.show', url);
-    return;
-  }
-
-  throw new Error('Neither the integrated browser nor Simple Browser is available in this VS Code build.');
+  log('Opening Tracy in the integrated browser.');
+  await vscode.commands.executeCommand('workbench.action.browser.open', url);
 }
 function getTraceFileName(resource: vscode.Uri): string {
   return path.posix.basename(resource.path) || resource.toString(true);

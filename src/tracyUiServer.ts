@@ -297,6 +297,7 @@ function injectBridgeScript(html: string): string {
       const pageId = typeof crypto.randomUUID === 'function'
         ? crypto.randomUUID()
         : String(Date.now()) + '-' + Math.random().toString(16).slice(2);
+      const moduleObject = typeof Module === 'object' && Module ? Module : (window.Module = {});
       const originalConsole = {
         debug: typeof console.debug === 'function' ? console.debug.bind(console) : console.log.bind(console),
         error: typeof console.error === 'function' ? console.error.bind(console) : console.log.bind(console),
@@ -304,8 +305,7 @@ function injectBridgeScript(html: string): string {
         log: typeof console.log === 'function' ? console.log.bind(console) : function () {},
         warn: typeof console.warn === 'function' ? console.warn.bind(console) : console.log.bind(console),
       };
-      let hasStarted = false;
-      let isRuntimeReady = false;
+      let hasLoadedProfiler = false;
 
       function createJsonReplacer() {
         const seen = new WeakSet();
@@ -390,11 +390,11 @@ function injectBridgeScript(html: string): string {
         };
       }
 
-      if (typeof Module === 'object' && Module) {
-        const originalPrintErr = typeof Module.printErr === 'function' ? Module.printErr.bind(Module) : undefined;
-        Module.printErr = function () {
+      if (moduleObject) {
+        const originalPrintErr = typeof moduleObject.printErr === 'function' ? moduleObject.printErr.bind(moduleObject) : undefined;
+        moduleObject.printErr = function () {
           if (originalPrintErr) {
-            originalPrintErr.apply(Module, arguments);
+            originalPrintErr.apply(moduleObject, arguments);
             return;
           }
 
@@ -421,21 +421,34 @@ function injectBridgeScript(html: string): string {
         postUiLog('error', 'unhandledrejection', [event.reason]);
       });
 
-      Module.postRun = Array.isArray(Module.postRun) ? Module.postRun : [];
-      Module.postRun.push(() => {
-        isRuntimeReady = true;
-        void openTraceIfReady();
-      });
-
-      async function openTraceIfReady() {
-        if (!traceUrl || !isRuntimeReady || hasStarted) {
+      function loadProfilerScript() {
+        if (hasLoadedProfiler) {
           return;
         }
 
-        hasStarted = true;
+        hasLoadedProfiler = true;
+        const script = document.createElement('script');
+        script.async = true;
+        script.type = 'text/javascript';
+        script.src = 'tracy-profiler.js';
+        script.addEventListener('error', function () {
+          console.error('[vscode-tracy] Failed to load tracy-profiler.js');
+          if (typeof moduleObject.setStatus === 'function') {
+            moduleObject.setStatus('Failed to load Tracy UI. See JavaScript console.');
+          }
+        });
+        document.body.appendChild(script);
+      }
+
+      async function prepareTraceAndStart() {
+        if (!traceUrl) {
+          loadProfilerScript();
+          return;
+        }
+
         try {
-          if (typeof Module.setStatus === 'function') {
-            Module.setStatus('Loading trace...');
+          if (typeof moduleObject.setStatus === 'function') {
+            moduleObject.setStatus('Loading trace...');
           }
 
           const response = await fetch(traceUrl, { cache: 'no-store' });
@@ -448,51 +461,47 @@ function injectBridgeScript(html: string): string {
           const buffer = await response.arrayBuffer();
           const bytes = new Uint8Array(buffer);
 
-          try {
-            if (FS.analyzePath('/upload.tracy').exists) {
-              FS.unlink('/upload.tracy');
+          moduleObject.arguments = ['upload.tracy'];
+          moduleObject.preRun = Array.isArray(moduleObject.preRun) ? moduleObject.preRun : [];
+          moduleObject.preRun.push(function () {
+            try {
+              if (FS.analyzePath('/upload.tracy').exists) {
+                FS.unlink('/upload.tracy');
+              }
+            } catch (_error) {
+              // Best effort cleanup before replacing the virtual file.
             }
-          } catch (_) {
-            // Best effort cleanup before replacing the virtual file.
-          }
 
-          FS.createDataFile('/', 'upload.tracy', bytes, true, true);
-          Module.ccall('nativeOpenFile', 'number', [], []);
-          FS.unlink('/upload.tracy');
-          document.title = 'Tracy Profiler - ' + fileName;
+            FS.createDataFile('/', 'upload.tracy', bytes, true, true);
+          });
 
-          if (typeof Module.setStatus === 'function') {
-            Module.setStatus('');
-          }
+          moduleObject.postRun = Array.isArray(moduleObject.postRun) ? moduleObject.postRun : [];
+          moduleObject.postRun.push(function () {
+            document.title = 'Tracy Profiler - ' + fileName;
+            if (typeof moduleObject.setStatus === 'function') {
+              moduleObject.setStatus('');
+            }
 
-          console.log('[vscode-tracy] Opened trace:', fileName);
+            console.log('[vscode-tracy] Opened trace:', fileName);
+          });
+
+          loadProfilerScript();
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          console.error('[vscode-tracy] Failed to open trace:', message);
-          if (typeof Module.setStatus === 'function') {
-            Module.setStatus('Failed to open trace. See JavaScript console.');
+          console.error('[vscode-tracy] Failed to prepare trace:', message);
+          if (typeof moduleObject.setStatus === 'function') {
+            moduleObject.setStatus('Failed to load trace. See JavaScript console.');
           }
         }
       }
 
-      const readyPoll = window.setInterval(() => {
-        if (isRuntimeReady) {
-          window.clearInterval(readyPoll);
-          return;
-        }
-
-        if (window.Module && window.Module.calledRun === true) {
-          isRuntimeReady = true;
-          window.clearInterval(readyPoll);
-          void openTraceIfReady();
-        }
-      }, 100);
+      void prepareTraceAndStart();
     })();
   </script>`;
 
   const bootstrapScriptTag = '<script async type="text/javascript" src="tracy-profiler.js"></script>';
   if (html.includes(bootstrapScriptTag)) {
-    return html.replace(bootstrapScriptTag, `  ${bridgeScript}\n    ${bootstrapScriptTag}`);
+    return html.replace(bootstrapScriptTag, `  ${bridgeScript}`);
   }
 
   return html.replace('</body>', `  ${bridgeScript}\n</body>`);

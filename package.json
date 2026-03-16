@@ -1,0 +1,75 @@
+{
+  "name": "vscode-tracy",
+  "displayName": "vscode-tracy",
+  "description": "vscode tracy ui",
+  "version": "0.0.1",
+  "publisher": "gglin001-vscode",
+  "license": "MIT",
+  "packageManager": "pnpm@10.30.0",
+  "homepage": "https://github.com/gglin001/vscode-tracy",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gglin001/vscode-tracy.git"
+  },
+  "engines": {
+    "vscode": "^1.110.0"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./dist/extension.js",
+  "files": [
+    "dist",
+    "scripts",
+    "tracy-ui",
+    "README.md",
+    "LICENSE"
+  ],
+  "activationEvents": [
+    "onCommand:vscode-tracy.openTrace",
+    "onCommand:vscode-tracy.showOutput"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "vscode-tracy.openTrace",
+        "title": "Open in Tracy",
+        "category": "Tracy"
+      },
+      {
+        "command": "vscode-tracy.showOutput",
+        "title": "Show Output",
+        "category": "Tracy"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "vscode-tracy.openTrace",
+          "when": "explorerResourceIsFolder == false && resourceExtname == .tracy",
+          "group": "navigation@50"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "vscode-tracy.openTrace",
+          "when": "resourceExtname == .tracy",
+          "group": "navigation@50"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "vsix": "pnpm compile && vsce package --no-yarn",
+    "package:vsix": "vsce package --no-yarn",
+    "tracy:fetch": "node ./scripts/fetch-tracy-ui.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.0",
+    "@types/vscode": "^1.110.0",
+    "@vscode/vsce": "^3.7.1",
+    "typescript": "^5.9.3"
+  }
+}
